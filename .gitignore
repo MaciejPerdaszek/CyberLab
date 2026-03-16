@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE - PyCharm
+.idea/
+
+# Data files
+data/raw/CICIDS2017
+#data/processed/
+
+# Models and Results
+#models/
+#results/
+
+# OS specific
+.DS_Store
+Thumbs.db
