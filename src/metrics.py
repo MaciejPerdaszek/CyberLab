@@ -11,26 +11,219 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    precision_score,
+    recall_score,
     roc_auc_score,
 )
 
-from src.ae import anomaly_threshold
-from src.io_utils import safe_name
+from .ae import anomaly_threshold
+from .io_utils import safe_name
 
 
-def classification_metrics(y_true: Any, y_pred: Any) -> dict[str, float]:
+def get_binary_scores(
+        model: Any,
+        X: Any,
+        *,
+        positive_label: int = 1,
+) -> np.ndarray | None:
+    classes = np.asarray(getattr(model, "classes_", []))
+
+    if hasattr(model, "predict_proba"):
+        probabilities = np.asarray(model.predict_proba(X))
+        if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+            return None
+
+        matches = np.flatnonzero(classes == positive_label)
+        if len(matches) != 1:
+            return None
+        return probabilities[:, int(matches[0])].astype(np.float64, copy=False)
+
+    if hasattr(model, "decision_function"):
+        scores = np.asarray(model.decision_function(X))
+
+        if scores.ndim == 1:
+            if len(classes) != 2:
+                return None
+            if classes[1] == positive_label:
+                return scores.astype(np.float64, copy=False)
+            if classes[0] == positive_label:
+                return (-scores).astype(np.float64, copy=False)
+            return None
+
+        if scores.ndim == 2:
+            matches = np.flatnonzero(classes == positive_label)
+            if len(matches) != 1:
+                return None
+            return scores[:, int(matches[0])].astype(np.float64, copy=False)
+
+    return None
+
+
+def false_alarm_metrics(
+        y_true: Any,
+        y_pred: Any,
+        *,
+        target: str,
+) -> dict[str, float | int]:
+    true_values = np.asarray(y_true)
+    predicted_values = np.asarray(y_pred)
+
+    if len(true_values) != len(predicted_values):
+        raise ValueError("y_true i y_pred mają różną liczbę elementów.")
+
+    normal_label: int | str = 0 if target == "Label_binary" else "Normal"
+    normal_mask = true_values == normal_label
+    normal_count = int(normal_mask.sum())
+
+    if normal_count == 0:
+        return {
+            "normal_samples": 0,
+            "false_alarm_count": 0,
+            "false_alarm_rate": np.nan,
+        }
+
+    false_alarm_count = int(np.sum(predicted_values[normal_mask] != normal_label))
     return {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "normal_samples": normal_count,
+        "false_alarm_count": false_alarm_count,
+        "false_alarm_rate": float(false_alarm_count / normal_count),
     }
 
 
+def evaluate_classification(
+        y_true: Any,
+        y_pred: Any,
+        *,
+        target: str,
+        binary_scores: np.ndarray | None = None,
+) -> dict[str, float | int]:
+    true_values = np.asarray(y_true)
+    predicted_values = np.asarray(y_pred)
+
+    result: dict[str, float | int] = {
+        "accuracy": float(accuracy_score(true_values, predicted_values)),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(true_values, predicted_values)
+        ),
+        "macro_precision": float(
+            precision_score(
+                true_values,
+                predicted_values,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "macro_recall": float(
+            recall_score(
+                true_values,
+                predicted_values,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "macro_f1": float(
+            f1_score(
+                true_values,
+                predicted_values,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "weighted_f1": float(
+            f1_score(
+                true_values,
+                predicted_values,
+                average="weighted",
+                zero_division=0,
+            )
+        ),
+        "roc_auc": np.nan,
+    }
+    result.update(
+        false_alarm_metrics(
+            true_values,
+            predicted_values,
+            target=target,
+        )
+    )
+
+    if target == "Label_binary":
+        result.update(
+            {
+                "attack_precision": float(
+                    precision_score(
+                        true_values,
+                        predicted_values,
+                        pos_label=1,
+                        average="binary",
+                        zero_division=0,
+                    )
+                ),
+                "attack_recall": float(
+                    recall_score(
+                        true_values,
+                        predicted_values,
+                        pos_label=1,
+                        average="binary",
+                        zero_division=0,
+                    )
+                ),
+                "attack_f1": float(
+                    f1_score(
+                        true_values,
+                        predicted_values,
+                        pos_label=1,
+                        average="binary",
+                        zero_division=0,
+                    )
+                ),
+            }
+        )
+
+        matrix = confusion_matrix(true_values, predicted_values, labels=[0, 1])
+        tn, fp, fn, tp = matrix.ravel()
+        result.update(
+            {
+                "true_negative_count": int(tn),
+                "false_positive_count": int(fp),
+                "false_negative_count": int(fn),
+                "true_positive_count": int(tp),
+            }
+        )
+
+        if binary_scores is not None:
+            scores = np.asarray(binary_scores, dtype=np.float64)
+            if len(scores) != len(true_values):
+                raise ValueError(
+                    "binary_scores i y_true mają różną liczbę elementów."
+                )
+            try:
+                result["roc_auc"] = float(roc_auc_score(true_values, scores))
+            except ValueError:
+                result["roc_auc"] = np.nan
+
+    return result
+
+
+def classification_metrics(
+        y_true: Any,
+        y_pred: Any,
+        *,
+        target: str,
+        binary_scores: np.ndarray | None = None,
+) -> dict[str, float | int]:
+    return evaluate_classification(
+        y_true,
+        y_pred,
+        target=target,
+        binary_scores=binary_scores,
+    )
+
+
 def anomaly_metrics_for_threshold(
-    y_binary: np.ndarray,
-    errors: np.ndarray,
-    threshold: float,
+        y_binary: np.ndarray,
+        errors: np.ndarray,
+        threshold: float,
 ) -> dict[str, Any]:
     predictions = (errors > threshold).astype(np.int32)
     attack_mask = y_binary == 1
@@ -62,10 +255,10 @@ def anomaly_metrics_for_threshold(
 
 
 def choose_best_anomaly_threshold(
-    normal_validation_errors: np.ndarray,
-    validation_errors: np.ndarray,
-    y_validation_binary: np.ndarray,
-    percentiles: list[float],
+        normal_validation_errors: np.ndarray,
+        validation_errors: np.ndarray,
+        y_validation_binary: np.ndarray,
+        percentiles: list[float],
 ) -> dict[str, Any]:
     if not percentiles:
         raise ValueError("Lista percentyli nie może być pusta.")
@@ -94,10 +287,10 @@ def choose_best_anomaly_threshold(
 
 
 def save_classification_outputs(
-    model_name: str,
-    y_true: Any,
-    predictions: Any,
-    results_path: Path,
+        model_name: str,
+        y_true: Any,
+        predictions: Any,
+        results_path: Path,
 ) -> None:
     results_path.mkdir(parents=True, exist_ok=True)
     stem = safe_name(model_name)
