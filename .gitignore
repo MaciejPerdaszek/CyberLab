@@ -17,11 +17,11 @@ env/
 
 # Data files
 data/raw/CICIDS2017
-#data/processed/
+data/processed/
 
 # Models and Results
 #models/
-#results/
+results/
 
 # OS specific
 .DS_Store
