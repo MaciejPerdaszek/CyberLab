@@ -18,7 +18,13 @@ from .ae import (
 )
 from .benchmark import benchmark_predictor
 from .config import RANDOM_STATE
-from .data import EvaluationTarget, TrainTestData, stratified_subsample, target_series
+from .data import (
+    EvaluationTarget,
+    TrainTestData,
+    stratified_subsample,
+    target_series,
+    unseen_attack_mask,
+)
 from .io_utils import safe_name, save_json
 from .metrics import (
     anomaly_metrics_for_threshold,
@@ -131,6 +137,8 @@ def train_classical_model(
         "target": target,
         "train_samples": len(X_fit),
         "test_samples": len(evaluation.X_eval),
+        "unseen_attack_classes": list(evaluation.unseen_attack_classes),
+        "unseen_attack_samples": evaluation.unseen_attack_samples,
         **metrics,
         "training_time_seconds": training_time,
         "prediction_time_seconds": prediction_time,
@@ -139,6 +147,7 @@ def train_classical_model(
             if prediction_time > 0.0
             else np.nan
         ),
+        "unseen_attack_detection_rate": unknown_rate,
         "unknown_attack_detection_rate": unknown_rate,
         "best_params": params,
     }
@@ -220,9 +229,12 @@ def train_ae_feature_rf(
         threshold,
     )
     anomaly_predictions = (test_errors > threshold).astype(np.int32)
-    unknown_mask = data.y_test["AttackClass"].astype(str).eq("Unknown").to_numpy()
+    unseen_mask = unseen_attack_mask(data).to_numpy(dtype=bool)
+    unseen_classes = sorted(
+        data.y_test.loc[unseen_mask, "AttackClass"].astype(str).unique().tolist()
+    )
     ae_unknown_detection_rate = (
-        float(anomaly_predictions[unknown_mask].mean()) if unknown_mask.any() else np.nan
+        float(anomaly_predictions[unseen_mask].mean()) if unseen_mask.any() else np.nan
     )
 
     rf_model = build_random_forest(rf_params, n_jobs=-1)
@@ -231,7 +243,10 @@ def train_ae_feature_rf(
     rf_training_time = time.perf_counter() - started
 
     if target == "AttackClass":
-        eval_mask = data.y_test["AttackClass"].astype(str).ne("Unknown").to_numpy()
+        train_classes = set(data.y_train["AttackClass"].astype(str).unique())
+        eval_mask = (
+            data.y_test["AttackClass"].astype(str).isin(train_classes).to_numpy()
+        )
         y_eval = (
             data.y_test.loc[eval_mask, "AttackClass"]
             .astype(str)
@@ -261,9 +276,9 @@ def train_ae_feature_rf(
     )
 
     final_unknown_detection_rate = np.nan
-    if target == "Label_binary" and unknown_mask.any():
+    if target == "Label_binary" and unseen_mask.any():
         final_unknown_detection_rate = float(
-            np.mean(np.asarray(predictions)[unknown_mask] == 1)
+            np.mean(np.asarray(predictions)[unseen_mask] == 1)
         )
 
     output_name = f"AE feature generator plus Random Forest_{target}"
@@ -290,6 +305,7 @@ def train_ae_feature_rf(
             "pipeline": "autoencoder_normal_feature_generator_plus_rf_all_classes",
             "random_state": RANDOM_STATE,
             "target": target,
+            "experiment_metadata": data.experiment_metadata,
             "latent_dimension": latent_dimension,
             "threshold_percentile": threshold_percentile,
             "anomaly_threshold": threshold,
@@ -333,6 +349,8 @@ def train_ae_feature_rf(
         "target": target,
         "train_samples": len(data.X_train),
         "test_samples": int(eval_mask.sum()),
+        "unseen_attack_classes": unseen_classes,
+        "unseen_attack_samples": int(unseen_mask.sum()),
         **metrics,
         "training_time_seconds": (
             ae_result.training_time_seconds + train_feature_time + rf_training_time
@@ -343,7 +361,9 @@ def train_ae_feature_rf(
             if total_prediction_time > 0.0
             else np.nan
         ),
+        "unseen_attack_detection_rate": final_unknown_detection_rate,
         "unknown_attack_detection_rate": final_unknown_detection_rate,
+        "ae_unseen_anomaly_detection_rate": ae_unknown_detection_rate,
         "ae_unknown_anomaly_detection_rate": ae_unknown_detection_rate,
         "latent_dimension": latent_dimension,
         "threshold_percentile": threshold_percentile,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -15,6 +17,7 @@ from src.config import RANDOM_STATE
 class TrainData:
     X: pd.DataFrame
     labels: pd.DataFrame
+    experiment_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,7 @@ class TrainTestData:
     X_test: pd.DataFrame
     y_train: pd.DataFrame
     y_test: pd.DataFrame
+    experiment_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,8 @@ class EvaluationTarget:
     y_eval: pd.Series
     X_unknown: pd.DataFrame
     unknown_mask_in_eval: pd.Series | None
+    unseen_attack_classes: tuple[str, ...] = ()
+    unseen_attack_samples: int = 0
 
 
 def _validate_features(X: pd.DataFrame, name: str) -> None:
@@ -49,6 +55,21 @@ def _validate_labels(labels: pd.DataFrame, name: str) -> None:
         raise ValueError(f"{name} nie zawiera kolumn: {sorted(missing)}")
     if labels[list(required)].isna().any().any():
         raise ValueError(f"{name} zawiera brakujące etykiety.")
+
+
+def _load_experiment_metadata(processed_path: Path) -> dict[str, Any]:
+    metadata_path = processed_path / "experiment_metadata.json"
+    if not metadata_path.exists():
+        return {
+            "experiment_type": "standard",
+            "scenario_name": processed_path.name or "standard",
+        }
+
+    with metadata_path.open("r", encoding="utf-8") as file:
+        metadata = json.load(file)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Plik {metadata_path} nie zawiera obiektu JSON.")
+    return metadata
 
 
 def load_train_data(processed_path: Path) -> TrainData:
@@ -68,7 +89,11 @@ def load_train_data(processed_path: Path) -> TrainData:
     if labels["AttackClass"].astype(str).eq("Unknown").any():
         raise ValueError("Zbiór treningowy nie może zawierać klasy Unknown.")
 
-    return TrainData(X.reset_index(drop=True), labels.reset_index(drop=True))
+    return TrainData(
+        X=X.reset_index(drop=True),
+        labels=labels.reset_index(drop=True),
+        experiment_metadata=_load_experiment_metadata(processed_path),
+    )
 
 
 def load_train_test_data(processed_path: Path) -> TrainTestData:
@@ -102,10 +127,11 @@ def load_train_test_data(processed_path: Path) -> TrainTestData:
         raise ValueError("Zbiór treningowy nie może zawierać klasy Unknown.")
 
     return TrainTestData(
-        X_train.reset_index(drop=True),
-        X_test.reset_index(drop=True),
-        y_train.reset_index(drop=True),
-        y_test.reset_index(drop=True),
+        X_train=X_train.reset_index(drop=True),
+        X_test=X_test.reset_index(drop=True),
+        y_train=y_train.reset_index(drop=True),
+        y_test=y_test.reset_index(drop=True),
+        experiment_metadata=_load_experiment_metadata(processed_path),
     )
 
 
@@ -117,28 +143,54 @@ def target_series(labels: pd.DataFrame, target: str) -> pd.Series:
     return labels[target].astype(np.int32).reset_index(drop=True)
 
 
+def unseen_attack_mask(data: TrainTestData) -> pd.Series:
+    train_classes = set(data.y_train["AttackClass"].astype(str).unique())
+    test_classes = data.y_test["AttackClass"].astype(str).reset_index(drop=True)
+    return (
+        ~test_classes.isin(train_classes)
+        & test_classes.ne("Normal")
+    ).reset_index(drop=True)
+
+
 def prepare_evaluation_target(data: TrainTestData, target: str) -> EvaluationTarget:
     y_train = target_series(data.y_train, target)
+    test_attack_classes = data.y_test["AttackClass"].astype(str).reset_index(drop=True)
+    unseen_mask = unseen_attack_mask(data)
+    unseen_classes = tuple(sorted(test_attack_classes.loc[unseen_mask].unique().tolist()))
 
     if target == "AttackClass":
-        known_mask = data.y_test["AttackClass"].astype(str).ne("Unknown")
+        train_classes = set(data.y_train["AttackClass"].astype(str).unique())
+        known_mask = test_attack_classes.isin(train_classes)
+        if not known_mask.any():
+            raise ValueError(
+                "Po odrzuceniu klas niewidzianych w treningu zbiór testowy jest pusty."
+            )
+        if unseen_mask.any():
+            warnings.warn(
+                "W teście wieloklasowym pominięto próbki klas niewidzianych podczas "
+                f"treningu: {list(unseen_classes)} ({int(unseen_mask.sum())} próbek). "
+                "Ich detekcję oceniaj w trybie Label_binary."
+            )
         return EvaluationTarget(
             X_train=data.X_train,
             y_train=y_train,
             X_eval=data.X_test.loc[known_mask].reset_index(drop=True),
-            y_eval=data.y_test.loc[known_mask, "AttackClass"].astype(str).reset_index(drop=True),
-            X_unknown=data.X_test.loc[~known_mask].reset_index(drop=True),
+            y_eval=test_attack_classes.loc[known_mask].reset_index(drop=True),
+            X_unknown=data.X_test.loc[unseen_mask].reset_index(drop=True),
             unknown_mask_in_eval=None,
+            unseen_attack_classes=unseen_classes,
+            unseen_attack_samples=int(unseen_mask.sum()),
         )
 
-    unknown_mask = data.y_test["AttackClass"].astype(str).eq("Unknown").reset_index(drop=True)
     return EvaluationTarget(
         X_train=data.X_train,
         y_train=y_train,
         X_eval=data.X_test,
         y_eval=target_series(data.y_test, target),
-        X_unknown=data.X_test.loc[unknown_mask].reset_index(drop=True),
-        unknown_mask_in_eval=unknown_mask,
+        X_unknown=data.X_test.loc[unseen_mask].reset_index(drop=True),
+        unknown_mask_in_eval=unseen_mask,
+        unseen_attack_classes=unseen_classes,
+        unseen_attack_samples=int(unseen_mask.sum()),
     )
 
 
